@@ -1,6 +1,7 @@
 import click
 import re
 import dateutil.parser
+import datetime
 from .errors import UnsupportedRecurrence
 
 
@@ -54,6 +55,10 @@ def maybe_quote_ws(value):
 
 """ Dates """
 
+def tw_datetime_to_ti(due):
+    dt = datetime.datetime.strptime(due, '%Y%m%dT%H%M%SZ')
+    return dt.isoformat()
+
 def parse_due(due):
     """Parse a due date from the due object.
 
@@ -68,7 +73,7 @@ def parse_due(due):
     if not due:
         return None
 
-    return parse_date(due['date'])
+    return parse_date(due.date)
 
 
 def parse_date(date):
@@ -87,9 +92,9 @@ def parse_date(date):
 
 def parse_recur(due):
     """Given a due object, extracts the recur """
-    if not due or not due['is_recurring']:
+    if not due or not due.is_recurring:
         return None
-    return parse_recur_string(due['string'])
+    return parse_recur_string(due.string)
 
 
 def parse_recur_string(date_string):

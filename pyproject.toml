@@ -11,6 +11,7 @@ taskw = {git = "https://github.com/adam-gaia/taskw.git", branch = "main"}
 todoist-python = "8.0.2" # Cannot update past 8.0.2 because nix build stuff breaks.
 # TODO: port to gitub:doist/todoist-api-python (which also breaks nix build stuff)
 pyyaml = "^6.0"
+todoist-api-python = "^2.0.2"
 
 [tool.poetry.dev-dependencies]
 black = "^22.8.0"
@@ -25,4 +26,5 @@ titwsync = 'todoist_taskwarrior.cli:cli'
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
+platform = "linux"
 

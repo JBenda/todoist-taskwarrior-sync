@@ -7,7 +7,7 @@ import io
 
 import yaml
 from taskw import TaskWarrior
-from todoist.api import TodoistAPI
+from todoist_api_python.api import TodoistAPI
 from . import errors, log, utils, validation
 
 # This is the location where the todoist
@@ -39,8 +39,7 @@ def cli():
                 and not is_help_cmd:
             log.error('Run configure first. Exiting.')
             exit(1)
-
-        todoist = TodoistAPI(config['todoist']['api_key'], cache=TODOIST_CACHE)
+        todoist = TodoistAPI(config['todoist']['api_key'])
 
         # Create the TaskWarrior client, overriding config to
         # create a `todoist_id` field which we'll use to
@@ -87,21 +86,6 @@ def configure(map_project, map_tag, todoist_api_key):
         yaml.dump(data, outfile, default_flow_style=False, allow_unicode=True)
 
 
-@cli.command()
-def synchronize():
-    """Update the local Todoist task cache.
-
-    This command accesses Todoist via the API and updates a local
-    cache before exiting. This can be useful to pre-load the tasks,
-    and means `migrate` can be run without a network connection.
-
-    NOTE - the local Todoist data cache is usually located at:
-
-        ~/.todoist-sync
-    """
-    with log.with_feedback('Syncing tasks with todoist'):
-        todoist.sync()
-
 
 @cli.command()
 @click.confirmation_option(
@@ -135,9 +119,6 @@ def sync(ctx):
     `todoist_id` property on the task.
     """
 
-    # Sync todoist to cache
-    ctx.invoke(synchronize)
-
     ti_project_list = _ti_project_list()
     default_project = utils.try_map(config['todoist']['project_map'], 'Inbox')
 
@@ -145,7 +126,11 @@ def sync(ctx):
 
     # Sync Taskwarrior->Todoist
     tw_tasks = taskwarrior.load_tasks()
-    log.important(f'Starting to sync tasks from Taskwarrior...')
+    log.important('Starting to sync tasks from Taskwarrior...')
+    ti_tasks_list = todoist.get_tasks()
+    ti_tasks = {}
+    for ti_task in ti_tasks_list:
+        ti_tasks[ti_task.id] = ti_task
     for tw_task in tw_tasks['pending']:
         if 'project' not in tw_task:
             tw_task['project'] = default_project
@@ -162,13 +147,12 @@ def sync(ctx):
         log.important(f'Sync Task {desc} ({project})')
 
         if 'todoist_id' in tw_task:
-            ti_task = todoist.items.get_by_id(tw_task['todoist_id'])
+            ti_task = ti_tasks[tw_task['todoist_id']]
             if ti_task is None:
                 # Ti task has been deleted
                 taskwarrior.task_delete(uuid=tw_task['uuid'])
                 continue
 
-            ti_task = ti_task['item']
             c_ti_task = _convert_ti_task(ti_task, ti_project_list)
 
             # Sync Todoist with Taskwarrior task
@@ -178,12 +162,8 @@ def sync(ctx):
         # Add Todoist task
         _ti_add_task(tw_task, ti_project_list)
 
-    with log.with_feedback('Syncing tasks with todoist'):
-        todoist.commit()
-        todoist.sync()
-
     # Sync Todoist->Taskwarrior
-    tasks = todoist.items.all()
+    tasks = todoist.get_tasks()
     log.important(f'Starting sync of {len(tasks)} tasks from Todoist...')
     for idx, ti_task in enumerate(tasks):
         c_ti_task = _convert_ti_task(ti_task, ti_project_list)
@@ -200,7 +180,7 @@ def sync(ctx):
         log.important(f'Sync Task {desc} ({project})')
 
         # Sync Todoist with Taskwarrior task
-        _, tw_task = taskwarrior.get_task(todoist_id=ti_task['id'])
+        _, tw_task = taskwarrior.get_task(todoist_id=ti_task.id)
         if bool(tw_task):
             if 'project' not in tw_task:
                 tw_task['project'] = default_project
@@ -210,41 +190,35 @@ def sync(ctx):
         # Add Taskwarrior task
         _tw_add_task(c_ti_task)
 
-    with log.with_feedback('Syncing tasks with todoist'):
-        todoist.commit()
-        todoist.sync()
-
 
 def _convert_ti_task(ti_task, ti_project_list):
     data = {}
-    data['tid'] = ti_task['id']
-    data['description'] = ti_task['content']
+    data['tid'] = ti_task.id
+    data['description'] = ti_task.content
 
     # Project
     project_name = ''
     for project_name, p in ti_project_list.items():
-        if p['id'] == ti_task['project_id']:
+        if p.id == ti_task.project_id:
             break
 
     data['project'] = project_name
 
     # Priority
-    data['priority'] = utils.ti_priority_to_tw(ti_task['priority'])
+    data['priority'] = utils.ti_priority_to_tw(ti_task.priority)
 
     # Tags
     data['tags'] = [
-        utils.try_map(config['todoist']['tag_map'],
-                      todoist.labels.get_by_id(l_id)['name'])
-        for l_id in ti_task['labels']
+        utils.try_map(config['todoist']['tag_map'], label)
+        for label in ti_task.labels
     ]
 
     # Dates
-    data['entry'] = utils.parse_date(ti_task['date_added'])
-    data['due'] = utils.parse_due(utils.try_get_model_prop(ti_task, 'due'))
-    data['recur'] = parse_recur_or_prompt(
-        utils.try_get_model_prop(ti_task, 'due'))
+    data['entry'] = utils.parse_date(ti_task.created_at)
+    data['due'] = utils.parse_due(ti_task.due)
+    data['recur'] = parse_recur_or_prompt(ti_task.due)
 
-    data['status'] = 'completed' if ti_task['checked'] == 1 else 'pending'
+    data['status'] = 'completed' if ti_task.is_completed == 1 else 'pending'
 
     return data
 
@@ -342,64 +316,48 @@ def _ti_update_task(tw_task, ti_project_list):
     with log.on_error(f"Todoist update '{description}' ({project})"):
         changed = False
 
-        ti_task = todoist.items.get_by_id(tw_task['todoist_id'])
+        ti_task = todoist.get_task(tw_task['todoist_id'])
 
-        if tw_task['description'] != ti_task['item']['content']:
-            ti_task['item']['content'] = tw_task['description']
+        if tw_task['description'] != ti_task.content:
+            ti_task.content = tw_task['description']
             changed = True
 
         project = ti_project_list[tw_task['project']]
-        if ti_task['item']['project_id'] != project['id']:
+        if ti_task.project_id != project.id:
+            ti_task.porject_id = project.id
             changed = True
 
         priority = 0
         if 'priority' in tw_task:
             priority = utils.tw_priority_to_ti(tw_task['priority'])
-        if ti_task['item']['priority'] != priority:
-            ti_task['item']['priority'] = priority
+        if ti_task.priority != priority:
+            ti_task.priority = priority
             changed = True
 
-        if ((ti_task['item']['checked'] == 0 and
+        if ((ti_task.is_completed == 0 and
                 tw_task['status'] == 'completed') or
-                (ti_task['item']['checked'] == 1 and
+                (ti_task.is_completed == 1 and
                  tw_task['status'] == 'pending')):
+            ti_task.is_completed = 1 if tw_task['status'] == 'completed' else 0
             changed = True
 
         if changed:
-            tid = ti_task['item']['id']
+            tid = ti_task.id
 
             log.info(f'Updating (todoist_id={tid})', nl=False)
             log.success('OK')
 
-            todoist.items.update(tid, **ti_task)
-
-            # Move to another project
-            if ti_task['item']['project_id'] != project['id']:
-                todoist.items.move(tid, project_id=project['id'])
-
-            # Open/close ti task
-            if ti_task['item']['checked'] == 1 and \
-                    tw_task['status'] == 'pending':
-                todoist.items.uncomplete(tid)
-            elif ti_task['item']['checked'] == 0 and \
-                    tw_task['status'] == 'completed':
-                todoist.items.complete(tid)
-            elif tw_task['status'] == 'waiting':
-                # taskwarrior doesn't like status=waiting
-                del(tw_task['status'])
+            todoist.update_task(tid, **vars(ti_task))
 
             tw_task['todoist_sync'] = datetime.datetime.now()
             taskwarrior.task_update(tw_task)
         else:
             # Always set latest sync time so no more sync accures
-            tid = ti_task['item']['id']
+            tid = ti_task.id
             log.info(f'TI updating (todoist_id={tid})...', nl=False)
             log.success('OK')
 
             # taskwarrior doesn't like status=waiting
-            if tw_task['status'] == 'waiting':
-                del(tw_task['status'])
-
             tw_task['todoist_sync'] = datetime.datetime.now()
             taskwarrior.task_update(tw_task)
 
@@ -416,14 +374,16 @@ def _ti_add_task(tw_task, ti_project_list):
             log.error(f'Project "{project}" not found on Todoist.')
             return
 
-        data['project_id'] = ti_project_list[tw_task['project']]['id']
+        data['project_id'] = ti_project_list[tw_task['project']].id
         if 'priority' in tw_task:
             data['priority'] = utils.tw_priority_to_ti(tw_task['priority'])
 
-        ti_task = todoist.items.add(tw_task['description'], **data)
-        todoist.commit()
+        if 'due' in tw_task:
+            data['due_datetime'] = utils.tw_datetime_to_ti(tw_task['due'])
 
-        tid = ti_task['id']
+        ti_task = todoist.add_task(tw_task['description'], **data)
+
+        tid = ti_task.id
         log.info(f'TI add (todoist_id={tid})')
 
         tw_task['todoist_id'] = tid
@@ -433,14 +393,14 @@ def _ti_add_task(tw_task, ti_project_list):
 
 def _ti_project_list():
     result = {}
-    for p in todoist.projects.all():
+    for p in todoist.get_projects():
         project_hierarchy = [p]
         pp = p
-        while pp['parent_id']:
-            pp = todoist.projects.get_by_id(p['parent_id'])
+        while pp.parent_id:
+            pp = todoist.get_project(p.parent_id)
             project_hierarchy.insert(0, pp)
 
-        project_name = '.'.join(p['name'] for p in project_hierarchy)
+        project_name = '.'.join(p.name for p in project_hierarchy)
         project_name = utils.try_map(
             config['todoist']['project_map'],
             project_name
@@ -456,7 +416,7 @@ def parse_recur_or_prompt(due):
     except errors.UnsupportedRecurrence:
         log.error(
             "Unsupported recurrence: '%s'. "
-            "Please enter a valid value" % due['string'])
+            "Please enter a valid value" % due.string)
         return log.prompt(
             'Set recurrence (todoist style)',
             default='',
